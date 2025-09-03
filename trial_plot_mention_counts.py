@@ -14,6 +14,14 @@ import streamlit as st
 
 INPUT_PATH = Path("data/youtube_pivoted_brand_counts.csv")
 COUNTS_INPUT = Path("data/youtube_brand_daily_counts.csv")  # must contain: date, keyword, video_mentions, top_channels
+CHANNEL_WEEKLY_SUMMARY = Path("data/youtube_brand_channel_week_summary.csv")  # week_start, keyword, channel, channel_id, matched_videos, views, likeCount, commentCount, subscribers, channel_video_count
+
+# Fallback: if weekly summary isn't under ./data, try ../data
+if not CHANNEL_WEEKLY_SUMMARY.exists():
+    alt = Path("../data/youtube_brand_channel_week_summary.csv")
+    if alt.exists():
+        CHANNEL_WEEKLY_SUMMARY = alt
+
 START_DATE = '2025-08-28'
 END_DATE = '2025-09-02'
 
@@ -60,48 +68,86 @@ else:
     with st.expander("Show data table"):
         st.dataframe(long_df.sort_values(["brand", "date"]).reset_index(drop=True))
 
-# --- Top channels for selected brands in the week ---
-if COUNTS_INPUT.exists() and selected:
+# --- Top channels for selected brands by Reach & Engagement (weekly per-channel summary) ---
+if selected and CHANNEL_WEEKLY_SUMMARY.exists():
     try:
-        df_counts = pd.read_csv(COUNTS_INPUT, encoding='utf-8')
-        # Ensure columns exist
-        required_cols = {"date", "keyword", "video_mentions", "top_channels"}
-        if required_cols.issubset(set(df_counts.columns)):
-            df_counts["date"] = pd.to_datetime(df_counts["date"])  # parse
-            # filter by window & selection
-            mask_counts = (
-                (df_counts["date"] >= pd.to_datetime(START_DATE)) &
-                (df_counts["date"] <= pd.to_datetime(END_DATE)) &
-                (df_counts["keyword"].isin(selected))
-            )
-            sub = df_counts.loc[mask_counts, ["keyword", "top_channels", "video_mentions"]].copy()
-            # split 'a;b;c' into rows; weight by video_mentions
-            sub["top_channels"] = sub["top_channels"].fillna("")
-            sub = sub.loc[sub["top_channels"] != ""]
-            if not sub.empty:
-                # explode into individual channel names
-                sub = sub.assign(channel=sub["top_channels"].str.split(";"))
-                sub = sub.explode("channel")
-                sub["channel"] = sub["channel"].str.strip()
-                # aggregate: sum video_mentions per (brand, channel)
-                agg = (sub.groupby(["keyword", "channel"], as_index=False)["video_mentions"].sum()
-                         .rename(columns={"video_mentions": "mentions"}))
-                # take top 3 per brand
-                top3 = (agg.sort_values(["keyword", "mentions"], ascending=[True, False])
-                           .groupby("keyword")
-                           .head(3)
-                           .reset_index(drop=True))
-                st.subheader("Top channels for selected brands (within window)")
-                st.dataframe(top3, use_container_width=True)
+        chw = pd.read_csv(CHANNEL_WEEKLY_SUMMARY, encoding='utf-8')
+        need_cols = {"week_start", "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"}
+        if need_cols.issubset(set(chw.columns)):
+            # parse dates
+            # filter by window (overlap) & selected brands
+            start_dt = pd.to_datetime(START_DATE)
+            end_dt = pd.to_datetime(END_DATE)
+
+            # Ensure week_start is datetime and synthesize week_end if missing (assume 7-day slices)
+            chw["week_start"] = pd.to_datetime(chw["week_start"])  # start of each 7-day slice
+            if "week_end" in chw.columns:
+                chw["week_end"] = pd.to_datetime(chw["week_end"])
             else:
-                st.info("No channel info available for the selected window/brands.")
+                chw["week_end"] = chw["week_start"] + pd.Timedelta(days=6)
+
+            # Select rows whose weekly window overlaps the selected window
+            overlaps = (chw["week_start"] <= end_dt) & (chw["week_end"] >= start_dt)
+            mask = overlaps & (chw["keyword"].isin(selected))
+
+            sub = chw.loc[mask, [
+                "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"
+            ]].copy()
+
+            # Coerce numerics (files can sometimes store counts as strings)
+            for col in ["subscribers", "views", "likeCount", "commentCount"]:
+                sub[col] = pd.to_numeric(sub[col], errors="coerce").fillna(0).astype(int)
+
+            if not sub.empty:
+                # Aggregate over possibly multiple weeks in the selected window
+                agg = (sub.groupby(["keyword", "channel"], as_index=False)
+                         .agg({
+                             "subscribers": "max",   # channel-level attribute: take max observed
+                             "views": "sum",
+                             "likeCount": "sum",
+                             "commentCount": "sum",
+                         }))
+                agg["engagement"] = agg["views"].fillna(0) + agg["likeCount"].fillna(0) + agg["commentCount"].fillna(0)
+
+                # Top 3 by Reach (subscribers)
+                top_reach = (agg.sort_values(["keyword", "subscribers"], ascending=[True, False])
+                                .groupby("keyword").head(3).reset_index(drop=True))
+                top_reach = top_reach.rename(columns={
+                    "subscribers": "reach (subscribers)",
+                    "views": "total views",
+                    "likeCount": "total likes",
+                    "commentCount": "total comments",
+                })
+                st.subheader("Top channels for selected brands (by reach: subscribers)")
+                st.dataframe(top_reach, use_container_width=True)
+
+                # Top 3 by Engagement (likes + views + comments)
+                top_eng = (agg.sort_values(["keyword", "engagement"], ascending=[True, False])
+                             .groupby("keyword").head(3).reset_index(drop=True))
+                top_eng = top_eng.rename(columns={
+                    "engagement": "total engagement (views+likes+comments)",
+                    "views": "total views",
+                    "likeCount": "total likes",
+                    "commentCount": "total comments",
+                })
+                st.subheader("Top channels for selected brands (by engagement: views + likes + comments)")
+                st.dataframe(top_eng[["keyword", "channel", "total engagement (views+likes+comments)", "total views", "total likes", "total comments"]], use_container_width=True)
+            else:
+                # Helpful hint: show what exists in the file to guide selection/window
+                try:
+                    min_w = chw["week_start"].min()
+                    max_w = chw["week_end"].max() if "week_end" in chw.columns else (chw["week_start"].max() + pd.Timedelta(days=6))
+                    brands_in_file = ", ".join(sorted(map(str, set(chw["keyword"].unique()))))
+                    st.info(f"No weekly channel data after filtering. Available weeks: {min_w.date()} → {max_w.date()}. Brands present: {brands_in_file}.")
+                except Exception:
+                    st.info("No weekly channel data available for the selected window/brands.")
         else:
-            st.info("Counts file found but missing required columns: date, keyword, video_mentions, top_channels")
+            st.info("Weekly channel summary missing required columns.")
     except Exception as e:
-        st.warning(f"Could not load top subreddit info: {e}")
+        st.warning(f"Could not load weekly channel summary: {e}")
 else:
-    if not COUNTS_INPUT.exists():
-        st.caption("Tip: Add 'data/youtube_brand_daily_counts.csv' (with 'top_channels') to show top channels here.")
+    if selected:
+        st.caption("Tip: Run your YouTube collector so it produces 'data/youtube_brand_channel_week_summary.csv' to show Reach & Engagement tables.")
 
 # --- Optional: Top 10 brands over the entire dataset, plotted over the selected week ---
 st.markdown("---")
