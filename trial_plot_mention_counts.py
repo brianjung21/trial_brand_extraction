@@ -15,7 +15,7 @@ import streamlit as st
 INPUT_PATH = Path("data/youtube_pivoted_brand_counts.csv")
 COUNTS_INPUT = Path("data/youtube_brand_daily_counts.csv")  # must contain: date, keyword, video_mentions, top_channels
 START_DATE = '2025-08-28'
-END_DATE = '2025-09-03'
+END_DATE = '2025-09-02'
 
 st.set_page_config(page_title="Trial Brand Mentions (More than a Week)", layout='wide')
 
