@@ -1,26 +1,10 @@
 """
-A Streamlit application visualizing weekly mentions of beauty brands across a dataset.
+A Streamlit application visualizing weekly mentions of YouTube brands across a dataset.
 
-This script analyzes beauty brand mentions within a specified date range and allows
+This script analyzes brand mentions from YouTube within a specified date range and allows
 users to interactively explore the data through plots and tables. It provides options
 to view mentions by selected brands, as well as aggregated insights into related
-subreddits and top brands.
-
-Attributes
-----------
-INPUT_PATH : pathlib.Path
-    Path to the CSV file containing brand mentions data.
-COUNTS_INPUT : pathlib.Path
-    Path to the CSV file containing daily counts and subreddit information.
-START_DATE : str
-    Start date of the analysis window in 'YYYY-MM-DD' format.
-END_DATE : str
-    End date of the analysis window in 'YYYY-MM-DD' format.
-
-Raises
-------
-Exception
-    If an unexpected error occurs while loading or processing the 'COUNTS_INPUT' file.
+channels and top brands.
 """
 
 from pathlib import Path
@@ -28,12 +12,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-INPUT_PATH = Path("data/alias_pivoted_brand_counts.csv")
-COUNTS_INPUT = Path("data/alias_brand_daily_counts.csv")  # must contain: date, keyword, post_mentions, top_subreddits
-START_DATE = '2025-08-24'
-END_DATE = '2025-08-31'
+INPUT_PATH = Path("data/youtube_pivoted_brand_counts.csv")
+COUNTS_INPUT = Path("data/youtube_brand_daily_counts.csv")  # must contain: date, keyword, video_mentions, top_channels
+START_DATE = '2025-08-28'
+END_DATE = '2025-09-03'
 
-st.set_page_config(page_title="Beauty Brand Mentions (Weekly)", layout='wide')
+st.set_page_config(page_title="Trial Brand Mentions (More than a Week)", layout='wide')
 
 df = pd.read_csv(INPUT_PATH, encoding='utf-8')
 df['date'] = pd.to_datetime(df['date'])
@@ -47,7 +31,7 @@ drop_cols_all = [c for c in ['date', 'total_mentions', 'num_brands_mentioned'] i
 brand_cols_all = [c for c in df.columns if c not in drop_cols_all]
 week[brand_cols] = week[brand_cols].fillna(0)
 
-st.title("Beauty Brand Mentions per Day (Weekly)")
+st.title("YouTube Brand Mentions per Day (More than a Week)")
 st.caption(f"Window: {START_DATE} -> {END_DATE}")
 
 totals = week[brand_cols].sum().sort_values(ascending=False)
@@ -76,12 +60,12 @@ else:
     with st.expander("Show data table"):
         st.dataframe(long_df.sort_values(["brand", "date"]).reset_index(drop=True))
 
-# --- Top subreddits for selected brands in the week ---
+# --- Top channels for selected brands in the week ---
 if COUNTS_INPUT.exists() and selected:
     try:
         df_counts = pd.read_csv(COUNTS_INPUT, encoding='utf-8')
         # Ensure columns exist
-        required_cols = {"date", "keyword", "post_mentions", "top_subreddits"}
+        required_cols = {"date", "keyword", "video_mentions", "top_channels"}
         if required_cols.issubset(set(df_counts.columns)):
             df_counts["date"] = pd.to_datetime(df_counts["date"])  # parse
             # filter by window & selection
@@ -90,34 +74,34 @@ if COUNTS_INPUT.exists() and selected:
                 (df_counts["date"] <= pd.to_datetime(END_DATE)) &
                 (df_counts["keyword"].isin(selected))
             )
-            sub = df_counts.loc[mask_counts, ["keyword", "top_subreddits", "post_mentions"]].copy()
-            # split 'a;b;c' into rows; weight by post_mentions
-            sub["top_subreddits"] = sub["top_subreddits"].fillna("")
-            sub = sub.loc[sub["top_subreddits"] != ""]
+            sub = df_counts.loc[mask_counts, ["keyword", "top_channels", "video_mentions"]].copy()
+            # split 'a;b;c' into rows; weight by video_mentions
+            sub["top_channels"] = sub["top_channels"].fillna("")
+            sub = sub.loc[sub["top_channels"] != ""]
             if not sub.empty:
-                # explode into individual subreddit names
-                sub = sub.assign(subreddit=sub["top_subreddits"].str.split(";"))
-                sub = sub.explode("subreddit")
-                sub["subreddit"] = sub["subreddit"].str.strip()
-                # aggregate: sum post_mentions per (brand, subreddit)
-                agg = (sub.groupby(["keyword", "subreddit"], as_index=False)["post_mentions"].sum()
-                         .rename(columns={"post_mentions": "mentions"}))
+                # explode into individual channel names
+                sub = sub.assign(channel=sub["top_channels"].str.split(";"))
+                sub = sub.explode("channel")
+                sub["channel"] = sub["channel"].str.strip()
+                # aggregate: sum video_mentions per (brand, channel)
+                agg = (sub.groupby(["keyword", "channel"], as_index=False)["video_mentions"].sum()
+                         .rename(columns={"video_mentions": "mentions"}))
                 # take top 3 per brand
                 top3 = (agg.sort_values(["keyword", "mentions"], ascending=[True, False])
                            .groupby("keyword")
                            .head(3)
                            .reset_index(drop=True))
-                st.subheader("Top subreddits for selected brands (within window)")
+                st.subheader("Top channels for selected brands (within window)")
                 st.dataframe(top3, use_container_width=True)
             else:
-                st.info("No subreddit info available for the selected window/brands.")
+                st.info("No channel info available for the selected window/brands.")
         else:
-            st.info("Counts file found but missing required columns: date, keyword, post_mentions, top_subreddits")
+            st.info("Counts file found but missing required columns: date, keyword, video_mentions, top_channels")
     except Exception as e:
         st.warning(f"Could not load top subreddit info: {e}")
 else:
     if not COUNTS_INPUT.exists():
-        st.caption("Tip: Add 'data/brand_daily_counts.csv' (with 'top_subreddits') to show top subreddits here.")
+        st.caption("Tip: Add 'data/youtube_brand_daily_counts.csv' (with 'top_channels') to show top channels here.")
 
 # --- Optional: Top 10 brands over the entire dataset, plotted over the selected week ---
 st.markdown("---")
