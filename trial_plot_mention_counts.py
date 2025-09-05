@@ -1,10 +1,8 @@
 """
-A Streamlit application visualizing weekly mentions of YouTube brands across a dataset.
-
-This script analyzes brand mentions from YouTube within a specified date range and allows
-users to interactively explore the data through plots and tables. It provides options
-to view mentions by selected brands, as well as aggregated insights into related
-channels and top brands.
+A Streamlit app for visualizing **weekly** YouTube brand metrics (mentions, API hits, views, likes, comments).
+Works with the combined weekly snapshot files:
+  - brand_weekly_for_streamlit.csv (from pivot_brand_counts.py)
+  - youtube_brand_channel_weekly_snapshot_ALL.csv (weekly per-channel breakdown)
 """
 
 from pathlib import Path
@@ -12,168 +10,149 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-INPUT_PATH = Path("data/youtube_pivoted_brand_counts.csv")
-COUNTS_INPUT = Path("data/youtube_brand_daily_counts.csv")  # must contain: date, keyword, video_mentions, top_channels
-CHANNEL_WEEKLY_SUMMARY = Path("data/youtube_brand_channel_week_summary.csv")  # week_start, keyword, channel, channel_id, matched_videos, views, likeCount, commentCount, subscribers, channel_video_count
+DATA_CANDIDATES = [
+    Path("../snapshot_data"),
+    Path("../data"),
+    Path("data"),
+]
+BRAND_WEEKLY_FILE = "brand_weekly_for_streamlit.csv"
+CHANNEL_WEEKLY_FILE = "youtube_brand_channel_weekly_snapshot_ALL.csv"
 
-# Fallback: if weekly summary isn't under ./data, try ../data
-if not CHANNEL_WEEKLY_SUMMARY.exists():
-    alt = Path("../data/youtube_brand_channel_week_summary.csv")
-    if alt.exists():
-        CHANNEL_WEEKLY_SUMMARY = alt
+def find_file(fname: str) -> Path:
+    for base in DATA_CANDIDATES:
+        p = base / fname
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Could not find {fname} in any of: {[str(b) for b in DATA_CANDIDATES]}")
 
-START_DATE = '2025-08-28'
-END_DATE = '2025-09-02'
+brand_path = find_file(BRAND_WEEKLY_FILE)
+df = pd.read_csv(brand_path, encoding='utf-8')
+if 'week_start' not in df.columns or 'keyword' not in df.columns:
+    st.stop()
+df['week_start'] = pd.to_datetime(df['week_start'])
+if 'week_end' in df.columns:
+    df['week_end'] = pd.to_datetime(df['week_end'])
+available_metrics = [c for c in [
+    'weekly_video_mentions', 'weekly_api_hits', 'weekly_views', 'weekly_likes', 'weekly_comments'
+] if c in df.columns]
+if not available_metrics:
+    st.stop()
 
-st.set_page_config(page_title="Trial Brand Mentions (More than a Week)", layout='wide')
+min_d, max_d = df['week_start'].min().date(), df['week_start'].max().date()
+st.set_page_config(page_title="YouTube Brands – Weekly Snapshot", layout='wide')
+st.title("YouTube Brands – Weekly Snapshot (Weekly granularity)")
+metric = st.selectbox("Metric", available_metrics, index=0)
+wk_range = st.date_input("Week range (by week_start)", value=(min_d, max_d))
+if isinstance(wk_range, tuple):
+    start_date, end_date = wk_range
+else:
+    start_date, end_date = min_d, wk_range
+mask = (df['week_start'].dt.date >= start_date) & (df['week_start'].dt.date <= end_date)
+week = df.loc[mask].copy()
 
-df = pd.read_csv(INPUT_PATH, encoding='utf-8')
-df['date'] = pd.to_datetime(df['date'])
-week = df[(df['date'] >= START_DATE) & (df['date'] <= END_DATE)].copy()
-
-drop_cols = [c for c in ['date', 'total_mentions', 'num_brands_mentioned'] if c in week.columns]
-brand_cols = [c for c in week.columns if c not in drop_cols]
-
-# Also compute brand columns on the full dataset to allow "top 10 over entire period"
-drop_cols_all = [c for c in ['date', 'total_mentions', 'num_brands_mentioned'] if c in df.columns]
-brand_cols_all = [c for c in df.columns if c not in drop_cols_all]
-week[brand_cols] = week[brand_cols].fillna(0)
-
-st.title("YouTube Brand Mentions per Day (More than a Week)")
-st.caption(f"Window: {START_DATE} -> {END_DATE}")
-
-totals = week[brand_cols].sum().sort_values(ascending=False)
+brand_cols = sorted(week['keyword'].unique())
+totals = (week.groupby('keyword')[metric].sum().sort_values(ascending=False))
 default_brands = list(totals.head(5).index)
-
-selected = st.multiselect("Pick brands to plot",
-                          options=brand_cols,
-                          default=default_brands)
-
-if not selected:
-    st.info("Select at least one brand to display the plot.")
-else:
-    long_df = week[['date'] + selected].melt(id_vars="date", var_name='brand', value_name='mentions')
-    fig = px.line(
-        long_df,
-        x='date',
-        y='mentions',
-        color='brand',
-        markers=True,
-        title='Daily Mentions for Selected Brands'
-    )
-    fig.update_layout(xaxis_title='Date', yaxis_title='Mentions', hovermode='x unified')
+selected = st.multiselect("Pick brands to plot", options=brand_cols, default=default_brands)
+if selected:
+    long_df = week[week['keyword'].isin(selected)][['week_start','keyword',metric]].rename(columns={'keyword':'brand','week_start':'x','%s'%metric:'y'})
+    fig = px.line(long_df, x='x', y='y', color='brand', markers=True,
+                  title=f'Weekly {metric} for selected brands')
+    fig.update_layout(xaxis_title='Week start (UTC)', yaxis_title=metric.replace('_',' ').title(), hovermode='x unified')
     st.plotly_chart(fig, use_container_width=True)
-
-
     with st.expander("Show data table"):
-        st.dataframe(long_df.sort_values(["brand", "date"]).reset_index(drop=True))
-
-# --- Top channels for selected brands by Reach & Engagement (weekly per-channel summary) ---
-if selected and CHANNEL_WEEKLY_SUMMARY.exists():
-    try:
-        chw = pd.read_csv(CHANNEL_WEEKLY_SUMMARY, encoding='utf-8')
-        need_cols = {"week_start", "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"}
-        if need_cols.issubset(set(chw.columns)):
-            # parse dates
-            # filter by window (overlap) & selected brands
-            start_dt = pd.to_datetime(START_DATE)
-            end_dt = pd.to_datetime(END_DATE)
-
-            # Ensure week_start is datetime and synthesize week_end if missing (assume 7-day slices)
-            chw["week_start"] = pd.to_datetime(chw["week_start"])  # start of each 7-day slice
-            if "week_end" in chw.columns:
-                chw["week_end"] = pd.to_datetime(chw["week_end"])
-            else:
-                chw["week_end"] = chw["week_start"] + pd.Timedelta(days=6)
-
-            # Select rows whose weekly window overlaps the selected window
-            overlaps = (chw["week_start"] <= end_dt) & (chw["week_end"] >= start_dt)
-            mask = overlaps & (chw["keyword"].isin(selected))
-
-            sub = chw.loc[mask, [
-                "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"
-            ]].copy()
-
-            # Coerce numerics (files can sometimes store counts as strings)
-            for col in ["subscribers", "views", "likeCount", "commentCount"]:
-                sub[col] = pd.to_numeric(sub[col], errors="coerce").fillna(0).astype(int)
-
-            if not sub.empty:
-                # Aggregate over possibly multiple weeks in the selected window
-                agg = (sub.groupby(["keyword", "channel"], as_index=False)
-                         .agg({
-                             "subscribers": "max",   # channel-level attribute: take max observed
-                             "views": "sum",
-                             "likeCount": "sum",
-                             "commentCount": "sum",
-                         }))
-                agg["engagement"] = agg["views"].fillna(0) + agg["likeCount"].fillna(0) + agg["commentCount"].fillna(0)
-
-                # Top 3 by Reach (subscribers)
-                top_reach = (agg.sort_values(["keyword", "subscribers"], ascending=[True, False])
-                                .groupby("keyword").head(3).reset_index(drop=True))
-                top_reach = top_reach.rename(columns={
-                    "subscribers": "reach (subscribers)",
-                    "views": "total views",
-                    "likeCount": "total likes",
-                    "commentCount": "total comments",
-                })
-                st.subheader("Top channels for selected brands (by reach: subscribers)")
-                st.dataframe(top_reach, use_container_width=True)
-
-                # Top 3 by Engagement (likes + views + comments)
-                top_eng = (agg.sort_values(["keyword", "engagement"], ascending=[True, False])
-                             .groupby("keyword").head(3).reset_index(drop=True))
-                top_eng = top_eng.rename(columns={
-                    "engagement": "total engagement (views+likes+comments)",
-                    "views": "total views",
-                    "likeCount": "total likes",
-                    "commentCount": "total comments",
-                })
-                st.subheader("Top channels for selected brands (by engagement: views + likes + comments)")
-                st.dataframe(top_eng[["keyword", "channel", "total engagement (views+likes+comments)", "total views", "total likes", "total comments"]], use_container_width=True)
-            else:
-                # Helpful hint: show what exists in the file to guide selection/window
-                try:
-                    min_w = chw["week_start"].min()
-                    max_w = chw["week_end"].max() if "week_end" in chw.columns else (chw["week_start"].max() + pd.Timedelta(days=6))
-                    brands_in_file = ", ".join(sorted(map(str, set(chw["keyword"].unique()))))
-                    st.info(f"No weekly channel data after filtering. Available weeks: {min_w.date()} → {max_w.date()}. Brands present: {brands_in_file}.")
-                except Exception:
-                    st.info("No weekly channel data available for the selected window/brands.")
-        else:
-            st.info("Weekly channel summary missing required columns.")
-    except Exception as e:
-        st.warning(f"Could not load weekly channel summary: {e}")
+        st.dataframe(long_df.sort_values(["brand","x"]).reset_index(drop=True))
 else:
-    if selected:
-        st.caption("Tip: Run your YouTube collector so it produces 'data/youtube_brand_channel_week_summary.csv' to show Reach & Engagement tables.")
+    st.info("Select at least one brand to display the plot.")
 
-# --- Optional: Top 10 brands over the entire dataset, plotted over the selected week ---
-st.markdown("---")
-show_top10 = st.checkbox("Show Top 10 brands (by total mentions over entire dataset)", value=False)
-if show_top10:
-    totals_all = df[brand_cols_all].fillna(0).sum().sort_values(ascending=False)
-    top10 = list(totals_all.head(10).index)
+if {'weekly_api_hits','weekly_video_mentions'}.issubset(set(week.columns)) and selected:
+    diff = (week[week['keyword'].isin(selected)]
+              .pivot_table(index='week_start', columns='keyword', values='weekly_api_hits', aggfunc='sum') -
+            week[week['keyword'].isin(selected)]
+              .pivot_table(index='week_start', columns='keyword', values='weekly_video_mentions', aggfunc='sum'))
+    st.subheader("API Hits minus Text-Confirmed (diagnostic)")
+    st.line_chart(diff.fillna(0))
 
-    if not top10:
-        st.info("No brands available to compute Top 10.")
+try:
+    ch_path = find_file(CHANNEL_WEEKLY_FILE)
+    chw = pd.read_csv(ch_path, encoding='utf-8')
+except Exception as e:
+    chw = None
+
+if selected and chw is not None:
+    need_cols = {"week_start", "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"}
+    if need_cols.issubset(set(chw.columns)):
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        chw["week_start"] = pd.to_datetime(chw["week_start"])
+        if "week_end" in chw.columns:
+            chw["week_end"] = pd.to_datetime(chw["week_end"])
+        else:
+            chw["week_end"] = chw["week_start"] + pd.Timedelta(days=6)
+
+        overlaps = (chw["week_start"] <= end_dt) & (chw["week_end"] >= start_dt)
+        mask = overlaps & (chw["keyword"].isin(selected))
+
+        sub = chw.loc[mask, [
+            "keyword", "channel", "subscribers", "views", "likeCount", "commentCount"
+        ]].copy()
+
+        for col in ["subscribers", "views", "likeCount", "commentCount"]:
+            sub[col] = pd.to_numeric(sub[col], errors="coerce").fillna(0).astype(int)
+
+        if not sub.empty:
+            agg = (sub.groupby(["keyword", "channel"], as_index=False)
+                     .agg({
+                         "subscribers": "max",
+                         "views": "sum",
+                         "likeCount": "sum",
+                         "commentCount": "sum",
+                     }))
+            agg["engagement"] = agg["views"].fillna(0) + agg["likeCount"].fillna(0) + agg["commentCount"].fillna(0)
+
+            top_reach = (agg.sort_values(["keyword", "subscribers"], ascending=[True, False])
+                            .groupby("keyword").head(3).reset_index(drop=True))
+            top_reach = top_reach.rename(columns={
+                "subscribers": "reach (subscribers)",
+                "views": "total views",
+                "likeCount": "total likes",
+                "commentCount": "total comments",
+            })
+            st.subheader("Top channels for selected brands (by reach: subscribers)")
+            st.dataframe(top_reach, use_container_width=True)
+
+            top_eng = (agg.sort_values(["keyword", "engagement"], ascending=[True, False])
+                         .groupby("keyword").head(3).reset_index(drop=True))
+            top_eng = top_eng.rename(columns={
+                "engagement": "total engagement (views+likes+comments)",
+                "views": "total views",
+                "likeCount": "total likes",
+                "commentCount": "total comments",
+            })
+            st.subheader("Top channels for selected brands (by engagement: views + likes + comments)")
+            st.dataframe(top_eng[["keyword", "channel", "total engagement (views+likes+comments)", "total views", "total likes", "total comments"]], use_container_width=True)
+        else:
+            try:
+                min_w = chw["week_start"].min()
+                max_w = chw["week_end"].max() if "week_end" in chw.columns else (chw["week_start"].max() + pd.Timedelta(days=6))
+                brands_in_file = ", ".join(sorted(map(str, set(chw["keyword"].unique()))))
+                st.info(f"No weekly channel data after filtering. Available weeks: {min_w.date()} → {max_w.date()}. Brands present: {brands_in_file}.")
+            except Exception:
+                st.info("No weekly channel data available for the selected window/brands.")
     else:
-        st.subheader("Top 10 brands – weekly plot")
-        top_week_long = week[["date"] + top10].melt(id_vars="date", var_name="brand", value_name="mentions")
-        fig2 = px.line(
-            top_week_long,
-            x="date",
-            y="mentions",
-            color="brand",
-            markers=True,
-            title="Daily Mentions for Top 10 Brands (over entire dataset), within selected week"
-        )
-        fig2.update_layout(xaxis_title='Date', yaxis_title='Mentions', hovermode='x unified')
-        st.plotly_chart(fig2, use_container_width=True)
+        st.info("Weekly channel summary missing required columns.")
+elif selected:
+    st.caption("Tip: Run your YouTube collector so it produces 'youtube_brand_channel_weekly_snapshot_ALL.csv' to show Reach & Engagement tables.")
 
-        # Table: weekly totals for these Top 10
-        week_totals = week[top10].fillna(0).sum().sort_values(ascending=False)
-        week_totals_df = week_totals.rename("week_total_mentions").reset_index().rename(columns={"index": "brand"})
-        st.subheader("Weekly totals for Top 10 brands")
-        st.dataframe(week_totals_df, use_container_width=True)
+st.markdown("---")
+show_top10 = st.checkbox("Show Top 10 brands (by total over selected weeks)", value=False)
+if show_top10 and not week.empty:
+    totals_sel = (week.groupby('keyword')[metric].sum().sort_values(ascending=False).head(10))
+    top10 = list(totals_sel.index)
+    top_long = week[week['keyword'].isin(top10)][['week_start','keyword',metric]].rename(columns={'keyword':'brand'})
+    fig2 = px.line(top_long, x='week_start', y=metric, color='brand', markers=True,
+                   title=f'Top 10 brands over selected weeks – {metric}')
+    fig2.update_layout(xaxis_title='Week start (UTC)', yaxis_title=metric.replace('_',' ').title())
+    st.plotly_chart(fig2, use_container_width=True)
+    st.dataframe(totals_sel.rename('total').reset_index().rename(columns={'keyword':'brand'}), use_container_width=True)
